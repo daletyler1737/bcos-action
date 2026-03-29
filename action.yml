@@ -1,10 +1,13 @@
 name: "BCOS v2 — Beacon Certified Open Source"
-description: "Verify repository trust score and certify open source quality on RustChain"
+description: |
+  Verify repository trust score and certify open source quality on RustChain.
+  Runs the BCOS v2 engine against any repo, posts PR comments with scores,
+  and anchors attestations to RustChain on merge.
 author: "Atlas (Bounty Hunter)"
 
 inputs:
   tier:
-    description: "Certification tier (L0, L1, L2)"
+    description: "Certification tier (L0, L1, or L2)"
     required: false
     default: "L1"
   reviewer:
@@ -16,33 +19,37 @@ inputs:
     required: false
     default: "https://50.28.86.131"
   github-token:
-    description: "GitHub token for PR comments"
+    description: "GitHub token for posting PR comments"
     required: false
     default: "${{ github.token }}"
   repo-path:
-    description: "Path to repository to scan (default: checkout path)"
+    description: "Path to repository to scan"
     required: false
     default: "${{ github.workspace }}"
 
 outputs:
   trust_score:
     description: "BCOS trust score (0-100)"
-    value: ${{ steps.run_bcos.outputs.trust_score }}
+    value: ${{ steps.run.outputs.trust_score }}
   cert_id:
-    description: "BCOS certificate ID"
-    value: ${{ steps.run_bcos.outputs.cert_id }}
+    description: "BCOS certificate ID (e.g. BCOS-a1b2c3d4)"
+    value: ${{ steps.run.outputs.cert_id }}
   tier_met:
-    description: "Whether the claimed tier was met"
-    value: ${{ steps.run_bcos.outputs.tier_met }}
+    description: "Whether the claimed tier threshold was met"
+    value: ${{ steps.run.outputs.tier_met }}
   score_breakdown:
-    description: "JSON breakdown of scores"
-    value: ${{ steps.run_bcos.outputs.score_breakdown }}
+    description: "URL-encoded JSON score breakdown"
+    value: ${{ steps.run.outputs.score_breakdown }}
 
 runs:
   using: "composite"
   steps:
+    - name: Set execute permission
+      shell: bash
+      run: chmod +x ${{ github.action_path }}/run_bcos.sh
+
     - name: Run BCOS Engine
-      id: run_bcos
+      id: run
       shell: bash
       env:
         TIER: ${{ inputs.tier }}
@@ -53,137 +60,5 @@ runs:
         GITHUB_REPOSITORY: ${{ github.repository }}
         GITHUB_SHA: ${{ github.sha }}
         GITHUB_PR_NUMBER: ${{ github.event.pull_request.number || '' }}
-      run: |
-        set -euo pipefail
-
-        REPO_PATH="${REPO_PATH:-$GITHUB_WORKSPACE}"
-        echo "trust_score=0" >> $GITHUB_OUTPUT
-        echo "cert_id=none" >> $GITHUB_OUTPUT
-        echo "tier_met=false" >> $GITHUB_OUTPUT
-        echo "score_breakdown={}" >> $GITHUB_OUTPUT
-
-        # Clone Rustchain to get bcos_engine.py
-        echo "📦 Fetching BCOS Engine..."
-        if [ ! -f "/tmp/bcos_engine.py" ]; then
-          curl -sL "https://raw.githubusercontent.com/Scottcjn/Rustchain/main/tools/bcos_engine.py" \
-            -o /tmp/bcos_engine.py \
-            || { echo "❌ Failed to download bcos_engine.py"; exit 0; }
-        fi
-
-        # Check required tools and install missing ones
-        install_tool() {
-          local tool=$1
-          local install_cmd=$2
-          if ! command -v $tool &>/dev/null; then
-            echo "🔧 Installing $tool..."
-            eval "$install_cmd" || echo "⚠️ $tool not available, will use fallback"
-          fi
-        }
-
-        install_tool semgrep "pip install semgrep || true"
-        install_tool pip-audit "pip install pip-audit || true"
-        install_tool pip-licenses "pip install pip-licenses || true"
-        install_tool cyclonedx-py "pip install cyclonedx-py || true"
-        install_tool osv-scanner "pip install osv-scanner || true"
-
-        # Run BCOS scan
-        echo "🔍 Running BCOS v2 scan (tier=$TIER)..."
-        cd "$REPO_PATH"
-
-        python3 /tmp/bcos_engine.py . \
-          --tier "$TIER" \
-          --reviewer "$REVIEWER" \
-          --json \
-          > /tmp/bcos_report.json 2>&1 \
-          || true
-
-        if [ ! -s /tmp/bcos_report.json ]; then
-          echo "❌ BCOS scan produced no output"
-          exit 0
-        fi
-
-        # Extract key fields
-        TRUST_SCORE=$(python3 -c "import json; d=json.load(open('/tmp/bcos_report.json')); print(d.get('trust_score', 0))")
-        CERT_ID=$(python3 -c "import json; d=json.load(open('/tmp/bcos_report.json')); print(d.get('cert_id', 'none'))")
-        TIER_MET=$(python3 -c "import json; d=json.load(open('/tmp/bcos_report.json')); print(str(d.get('tier_met', False)).lower())")
-        BREAKDOWN=$(python3 -c "import json; d=json.load(open('/tmp/bcos_report.json')); import urllib.parse; print(urllib.parse.quote(json.dumps(d.get('score_breakdown', {}))))")
-
-        echo "trust_score=$TRUST_SCORE" >> $GITHUB_OUTPUT
-        echo "cert_id=$CERT_ID" >> $GITHUB_OUTPUT
-        echo "tier_met=$TIER_MET" >> $GITHUB_OUTPUT
-        echo "score_breakdown=$BREAKDOWN" >> $GITHUB_OUTPUT
-
-        echo ""
-        echo "========================================"
-        echo "  BCOS v2 Result: Score=$TRUST_SCORE, Cert=$CERT_ID, Met=$TIER_MET"
-        echo "========================================"
-
-        # Post PR comment
-        if [ -n "$GITHUB_PR_NUMBER" ] && [ "$GITHUB_PR_NUMBER" != "" ]; then
-          echo "💬 Posting PR comment..."
-
-          # Build badge
-          if [ "$TIER_MET" = "true" ]; then
-            BADGE="![BCOS](https://img.shields.io/badge/BCOS-$CERT_ID-green?style=flat-square)"
-            EMOJI="✅"
-          else
-            BADGE="![BCOS](https://img.shields.io/badge/BCOS-$CERT_ID-yellow?style=flat-square)"
-            EMOJI="⚠️"
-          fi
-
-          COMMENT_BODY=$(cat <<EOF
-## 🤖 BCOS v2 — Beacon Certified Open Source
-
-$BADGE
-
-**Trust Score:** \`$TRUST_SCORE / 100\`
-**Tier:** \`$TIER\`
-**Result:** $EMOJI \`$([ "$TIER_MET" = "true" ] && echo "PASSED" || echo "FAILED")\`
-**Cert ID:** \`$CERT_ID\`
-
-### Score Breakdown
-
-| Component | Score |
-|-----------|-------|
-| License Compliance (20) | \`$TRUST_SCORE\` |
-| Vulnerability Scan (25) | See full report |
-| Static Analysis (20) | See full report |
-| SBOM Completeness (10) | See full report |
-| Dependency Freshness (5) | See full report |
-| Test Evidence (10) | See full report |
-| Review Attestation (10) | \`$TIER\` tier |
-
-**Full Report:** \`/tmp/bcos_report.json\`
-**Verify:** https://rustchain.org/bcos/verify/$CERT_ID
-
----
-*🤖 BCOS v2 GitHub Action — 25 RTC Bounty — Powered by RustChain*
-EOF
-)
-
-          # Escape the comment body for JSON
-          COMMENT_ESCAPED=$(python3 -c "import json; print(json.dumps($COMMENT_BODY))")
-
-          curl -s -X POST \
-            -H "Authorization: token $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/issues/$GITHUB_PR_NUMBER/comments" \
-            -d "{\"body\": $COMMENT_ESCAPED}" \
-            || echo "⚠️ Failed to post PR comment"
-
-          echo "✅ PR comment posted"
-        fi
-
-        # On merge event: anchor attestation to RustChain
-        if [ "$GITHUB_EVENT_NAME" = "push" ] && [[ "$GITHUB_REF" == refs/heads/* ]]; then
-          echo "🔗 Anchoring attestation to RustChain..."
-          curl -s -X POST \
-            --max-time 10 \
-            "${NODE_URL}/api/attest" \
-            -H "Content-Type: application/json" \
-            -d @" /tmp/bcos_report.json" \
-            || echo "⚠️ Attestation anchoring failed (node may be offline)"
-        fi
-
-        echo "✅ BCOS GitHub Action complete"
+        GITHUB_EVENT_NAME: ${{ github.event_name }}
+      run: ${{ github.action_path }}/run_bcos.sh
